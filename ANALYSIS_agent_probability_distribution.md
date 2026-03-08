@@ -214,17 +214,36 @@ Stage 2 CPT (128K) одновременно вводит расширение к
 
 Data scaling 0→315B показывает рост. Но дал бы тот же объём (315B токенов агентных данных) такой же рост, если подать его как часть pre-training mix, а не как отдельную стадию? CPT на 315B токенов — по сути ещё один раунд pre-training на специализированных данных. Разница между «midtraining» и «pre-training с агентными данными» может быть номинальной.
 
-### 7.2 Что репозиторий всё-таки доказывает
+### 7.2 Конкретные свидетельства из статьи (ablation tables)
+
+**Ablation: CPT vs No CPT (Table 3, across 3 SFT configs):**
+
+| SFT Config | Avg improvement (AgentFounder-Base vs Qwen3-Base) |
+|---|---|
+| SFT-A | +5.75% |
+| SFT-B | +6.13% |
+| SFT-C | +6.45% |
+
+Максимальное улучшение: +14.3% на BrowseComp-en с SFT-C. CPT стабильно помогает **всем** SFT-конфигурациям.
+
+**Dual-burden: конкретное свидетельство (Figure 7):**
+Все варианты AgentFounder CPT достигают заметно более низкого SFT loss по сравнению с baseline при обучении на идентичных SFT-A данных (1,340 шагов). Baseline: loss = 0.8656. AgentFounder 315B: loss = **0.7953**. CPT предоснащает модель фундаментальными способностями → post-training может фокусироваться на alignment, а не учить с нуля.
+
+**MoE activation (Appendix B.4):** После CPT распределение экспертов в MoE становится более сбалансированным в финальных слоях (вместо концентрации), что снижает риск «dead experts» и повышает стабильность при post-training.
+
+### 7.3 Что репозиторий/статья доказывает
 
 1. **Агентные данные важны** — data scaling от 0 до 315B показывает монотонный рост
-2. **Длинный контекст при обучении важен** — обрезанные траектории хуже полных
-3. **Post-training alone оставляет gap** — Qwen3-30B-A3B baseline 0.5% vs AgentFounder 40.0% на BrowseComp-EN
-4. **Dual-burden — наблюдаемый эффект, но не доказанный механизм** — не подтверждён ablation (напр., двухэтапный SFT: сначала паттерны, потом стиль — без CPT)
+2. **Длинный контекст при обучении важен** — Stage 2 (128K) даёт +3.3% P@1 vs Stage 1 only
+3. **CPT снижает SFT loss** — конкретные числа: 0.8656 → 0.7953 (Figure 7)
+4. **CPT помогает всем SFT-конфигурациям** — +5.75% до +6.45% через 3 разных SFT рецепта
+5. **HAS дополняет FAS** — Table 5: FAS alone +7.2% BC-zh P@1, FAS+HAS +10.3% BC-zh P@1
+6. **Dual-burden — наблюдаемый эффект с конкретными метриками** — SFT loss gap и MoE activation balance
 
-### 7.3 Что не доказано
+### 7.4 Что всё ещё не доказано
 
-- Что CPT *как стадия* даёт что-то, чего не может дать aggressive SFT с тем же объёмом и качеством данных
-- Что dual-burden — оптимизационный конфликт, а не просто недостаточный объём данных при SFT
+- Что CPT *как стадия* даёт что-то, чего не может дать aggressive SFT с тем же объёмом (200B+100B=300B токенов) и качеством данных. **Table 3 показывает CPT vs no-CPT, но no-CPT baseline получает ноль агентных CPT-данных** — это не fair comparison с «те же данные как SFT»
+- Что dual-burden — именно оптимизационный конфликт стадий, а не просто эффект «больше данных → лучше». SFT loss gap (0.8656 vs 0.7953) может объясняться тем, что CPT-модель просто видела в ~100× больше релевантных данных
 - Что эффект CPT нельзя воспроизвести скаффолдингом + более мощной моделью
 - Что «midtraining» отличается от «pre-training с добавленными агентными данными» чем-то, кроме позиции в пайплайне
 
@@ -242,15 +261,13 @@ Midtraining в текущем виде — это доказанно *работ
 
 **Цель:** Учит модель составлять план *до* первого вызова инструмента.
 
-**Процесс синтеза:**
-1. Берётся QA-пара (формат из `WebDancer/datasets/sample_qa.jsonl`):
-   ```json
-   {"question": "Identify the superhero movie...", "answer": "league of extraordinary gentlemen", "tag": "e2hqa"}
-   ```
-2. Сильная модель-учитель генерирует план поиска: декомпозицию вопроса на подзадачи + reasoning chain от плана к ответу
-3. Результат — тренировочный пример: `<think>план + reasoning</think><tool_call>первый вызов</tool_call>`
+**Точная процедура (из полной статьи arXiv:2509.13310):**
+1. **Вход:** Запрос Q, сгенерированный из multi-style question synthesis pipeline
+2. **Выход:** K разнообразных анализов проблемы, каждый с prediction первого действия (tool invocation или прямой ответ). **Без реальных API-вызовов.**
+3. **Ключевой трюк:** Вместо K reasoning-action вариантов для одного вопроса (высокая температура даёт похожие выходы), генерируются reasoning-action данные для **K разных вопросов, которые разделяют одну knowledge memory, но различаются по стилю**. Это лучше покрывает тренировочное пространство.
+4. **Контроль качества:** Reject sampling через LLM-as-Judge. Начальная генерация FAS даёт 50/50 correct/incorrect. Фильтр удаляет 43.5% проблемных сэмплов, повышая accuracy с **50% до 82%**. Ошибки: Content Inconsistency 26.2%, Search Necessity 6.9%, Logic Discontinuity 5.7%, Parameter Deviation 3.5%, Invalid Tool 1.2%.
 
-**Артефакт:** Выход виден в `sample_traj.jsonl` — первый `<think>` блок содержит планирование:
+**Артефакт в репозитории** (`sample_traj.jsonl`):
 ```
 <think>Okay, let's tackle this question step by step.
 The user is asking about a prestigious British equestrian event...
@@ -261,55 +278,95 @@ Let me search for this.</think>
 
 ### 8.2 FAS-Reasoning (First-order Action Synthesis — Reasoning)
 
-**Цель:** Учит модель делать правильные выводы из уже найденной информации (fully informed setting).
+**Цель:** Учит модель делать правильные выводы из уже найденной информации.
 
-**Процесс синтеза:**
-1. Вопрос + его knowledge graph (формат из `WebShaper/data/webshaper.500.jsonl`):
-   ```json
-   {"question": "...", "answer": "12,000",
-    "formalization": [["V@M","is opening match of","V@X"], ["V@X","has record for","C@10"]],
-    "urls": ["https://en.wikipedia.org/wiki/..."]}
-   ```
-2. `formalization` — граф знаний с переменными (V@) и константами (C@). `urls` — источники.
-3. Генерируется цепочка: «из документа A → факт X, из B → факт Y, X+Y → ответ Z»
+**Точная двухшаговая процедура (из статьи):**
+1. **Шаг 1:** LLM декомпозирует вопрос Q на подвопросы, генерирует спекулятивные ответы из внутренних знаний → предварительный ответ A1. **Инструменты запрещены.**
+2. **Шаг 2:** Дан Q + mapped requisite knowledge (из entity-anchored memory) → модель уточняет A1, исправляет логические ошибки → финальный ответ A2. **Инструменты запрещены.**
+
+**Почему два шага, а не один:** Если сразу дать вопрос + нужные знания, модель механически использует знания как промежуточные узлы рассуждения вместо симуляции аутентичного мышления. Двухшаговый дизайн заставляет сначала рассуждать из внутренних знаний, потом интегрировать внешние.
+
+**Контроль качества:** LLM-as-Judge оценивает alignment между A2 и ground truth.
+
+**Формат данных** (из `WebShaper/data/webshaper.500.jsonl`):
+```json
+{"question": "...", "answer": "12,000",
+ "formalization": [["V@M","is opening match of","V@X"], ["V@X","has record for","C@10"]],
+ "urls": ["https://en.wikipedia.org/wiki/..."]}
+```
 
 ### 8.3 HAS (Higher-order Action Synthesis — Decision-Making)
 
-**Цель:** Превращает одну траекторию в дерево решений через PPL-guided ветвление.
+**Цель:** Превращает одну траекторию в пошаговое пространство решений.
 
-**Реализация** (из `ParallelMuse/functionality_specified_partial_rollout.py`):
+**Точная процедура (из статьи):**
 
-1. Для каждого шага вычисляется perplexity (строки 113-157):
-   ```python
-   think_ppl = np.exp(np.mean(entropies[think_start+1: think_end]))
-   tool_call_ppl = np.exp(np.mean(entropies[tool_call_start+1: tool_call_end]))
-   ```
-2. Выбираются шаги с максимальной неопределённостью (строки 285-317):
-   ```python
-   branch_step = sorted(branch_step, key=lambda x: x['step_ppl'], reverse=True)[:topk]
-   ```
-3. На каждом выбранном шаге генерируются альтернативные продолжения:
-   ```python
-   rollout_single_traj(..., r['rollout'][:int(b['step_id'])], ...)  # обрезка до точки ветвления
-   ```
+Дана задача Q и траектория T = {(S1,R1),...,(SK,RK)} с бинарной оценкой успеха J:
+
+1. **Step-level Scaling:** Для каждого шага Sk контекст = (Q, S1, R1, ..., S(k-1), R(k-1)). **Без реального выполнения инструментов** LLM генерирует **N альтернативных «thought and invocation» кандидатов**, создавая набор Ak = {Sk(1),...,Sk(N)}. Оригинальный шаг объединяется с N кандидатами → (N+1) вариантов, **случайно перемешанных**, с записью позиции оригинала nk. Это создаёт **(N+1) × K потенциальных reasoning-actions** на траекторию.
+
+2. **Contrastive Decision-Action Synthesis:** Для каждого шага k все варианты Ak перечисляются явно. Вставляется оператор выбора: **«I will choose option nk»**, за которым следует реальный ответ Rk. В конце — оценка: **«My decision is {Correct/Incorrect}»** (из J). Полный тренировочный пример = задача + process выбора для каждого шага + финальная оценка.
+
+**Ключевой инсайт:** Это трансформирует имитацию траекторий в пошаговое принятие решений. Модель видит множество вариантов на каждом шаге с явными решениями и feedback — учится *решать*, а не *запоминать последовательности*.
+
+**Реализация в коде** (из `ParallelMuse/functionality_specified_partial_rollout.py`):
+
+PPL-guided ветвление (аналог, используемый для inference-time и data synthesis):
+```python
+# строки 113-157: вычисление PPL для каждого шага
+think_ppl = np.exp(np.mean(entropies[think_start+1: think_end]))
+tool_call_ppl = np.exp(np.mean(entropies[tool_call_start+1: tool_call_end]))
+
+# строки 285-317: выбор шагов с максимальной неопределённостью
+branch_step = sorted(branch_step, key=lambda x: x['step_ppl'], reverse=True)[:topk]
+
+# строки 439-446: генерация альтернатив от точки ветвления
+rollout_single_traj(..., r['rollout'][:int(b['step_id'])], ...)
+```
 
 **Режимы PPL:** `tool_call_ppl`, `think_ppl`, `mixed_ppl` (50/50), `all_ppl`
-
-**Параметры по умолчанию:** `partial_sampling_topk=2` (2 точки ветвления), `partial_sampling_times_per_pos=3` (3 альтернативы на точку), `sampling_budget=8`
+**Параметры по умолчанию:** `partial_sampling_topk=2`, `partial_sampling_times_per_pos=3`, `sampling_budget=8`
 
 ### 8.4 Open-World Memory
 
-**Цель:** Документы → knowledge graph → агентные тренировочные данные.
+**Цель:** Документы → entity-anchored memory → агентные тренировочные данные.
 
-Конвейер: потоки данных → структурированная «память» → формализация (тройки `сущность-отношение-сущность`) → синтез QA-пар, для которых гарантированно нужен многошаговый поиск.
+**Точная процедура (из статьи):**
+
+1. **Источники:** (a) web-crawled data, (b) исторические tool invocation results, (c) CommonCrawl, (d) отброшенные траектории из post-training
+2. **Трансформация:** Текст → entity-anchored declarative statements. **Не моделируются межсущностные отношения** (в отличие от классических knowledge graphs). Вместо этого максимизируется **плотность утверждений на сущность**, с сохранением timestamps, источников, стилистических особенностей.
+   - Пример: «Tourist arrivals in France increased from 3,793K in May to 4,222K in June» → `("France", "Tourist arrivals reached 4,222K in June 2025")`
+3. **Синтез QA четырёх типов:** factual retrieval, numerical computation, multi-hop reasoning, synthesis tasks
+4. **Живая система:** Новые результаты поиска непрерывно расширяют и сущности, и их утверждения
 
 Код не опубликован, но формат виден в `webshaper.500.jsonl`.
 
 ### 8.5 Двухстадийный CPT (32K → 128K)
 
-- **Stage 1 (32K):** Короткие траектории (3-8 шагов). FAS-Planning + FAS-Reasoning. Цель: «грамматика» агентного формата.
-- **Stage 2 (128K):** Полные траектории (15-30+ шагов). HAS данные. Цель: удержание агентного поведения на длинных горизонтах.
-- **Эффект:** +3.3% Pass@1 vs одностадийный CPT. Обучение на обрезанных траекториях значительно хуже.
+**Точные объёмы (из статьи):**
+
+- **Stage 1 (32K):** ~200B токенов агентных данных + knowledge reasoning corpora. Преимущественно FAS + короткие HAS. Небольшая доля general pre-training data вмешана.
+- **Stage 2 (128K):** ~100B токенов высококачественных агентных данных. Преимущественно HAS (длинные траектории, обрезанные в Stage 1). Небольшая доля general pre-training data.
+- **Base model:** Qwen3-30B-A3B-Base
+- **Training hyperparams:** НЕ опубликованы (learning rate, batch size, optimizer, warmup)
+- **Inference hyperparams:** temperature 0.85, repetition penalty 1.1, top-p 0.95, max 128 tool calls, 128K context
+
+**Ablation (Table 4 из статьи, 50B токенов, SFT-A):**
+
+| Strategy | BC-en P@1 | BC-zh P@1 | GAIA P@1 | Avg ΔP@1 |
+|---|---|---|---|---|
+| Stage 1 Only | 31.4 | 34.3 | 69.9 | — |
+| Stage 1 & 2 | 35.5 | 37.2 | 72.8 | **+3.3%** |
+
+**Ablation FAS vs FAS+HAS (Table 5, 50B токенов, single-stage):**
+
+| Data | BC-en P@1 | BC-zh P@1 | GAIA P@1 |
+|---|---|---|---|
+| No CPT (0B) | 26.9 | 29.8 | 67.0 |
+| FAS only (50B) | 31.4 | 37.0 | 72.8 |
+| FAS+HAS (50B) | 31.4 | 40.1 | 69.9 |
+
+FAS alone даёт массивный прирост. HAS даёт дополнительный бонус, особенно на BC-zh (+3.1% P@1 vs FAS-only).
 
 ### 8.6 ReSum + ReSum-GRPO (Scaffold-уровневый midtraining)
 
