@@ -233,3 +233,149 @@ Data scaling 0→315B показывает рост. Но дал бы тот ж�
 Midtraining в текущем виде — это доказанно *работающая* комбинация: (специализированные агентные данные FAS/HAS) + (длинный контекст 128K) + (большой объём 315B токенов) + (отдельная стадия обучения до SFT/RL).
 
 Но **необходимость именно отдельной стадии** (а не подмешивания тех же данных в pre-training или в aggressive SFT) — это claim, не подтверждённый контролируемыми экспериментами в репозитории.
+
+---
+
+## 8. Конкретные техники мидтрейнинга: подробный разбор по коду и данным
+
+### 8.1 FAS-Planning (First-order Action Synthesis — Planning)
+
+**Цель:** Учит модель составлять план *до* первого вызова инструмента.
+
+**Процесс синтеза:**
+1. Берётся QA-пара (формат из `WebDancer/datasets/sample_qa.jsonl`):
+   ```json
+   {"question": "Identify the superhero movie...", "answer": "league of extraordinary gentlemen", "tag": "e2hqa"}
+   ```
+2. Сильная модель-учитель генерирует план поиска: декомпозицию вопроса на подзадачи + reasoning chain от плана к ответу
+3. Результат — тренировочный пример: `<think>план + reasoning</think><tool_call>первый вызов</tool_call>`
+
+**Артефакт:** Выход виден в `sample_traj.jsonl` — первый `<think>` блок содержит планирование:
+```
+<think>Okay, let's tackle this question step by step.
+The user is asking about a prestigious British equestrian event...
+First, the figure associated with Christmas gift-giving...
+Let me search for this.</think>
+<tool_call>{"name":"search","arguments":{"query":["1964 British horse race..."]}}</tool_call>
+```
+
+### 8.2 FAS-Reasoning (First-order Action Synthesis — Reasoning)
+
+**Цель:** Учит модель делать правильные выводы из уже найденной информации (fully informed setting).
+
+**Процесс синтеза:**
+1. Вопрос + его knowledge graph (формат из `WebShaper/data/webshaper.500.jsonl`):
+   ```json
+   {"question": "...", "answer": "12,000",
+    "formalization": [["V@M","is opening match of","V@X"], ["V@X","has record for","C@10"]],
+    "urls": ["https://en.wikipedia.org/wiki/..."]}
+   ```
+2. `formalization` — граф знаний с переменными (V@) и константами (C@). `urls` — источники.
+3. Генерируется цепочка: «из документа A → факт X, из B → факт Y, X+Y → ответ Z»
+
+### 8.3 HAS (Higher-order Action Synthesis — Decision-Making)
+
+**Цель:** Превращает одну траекторию в дерево решений через PPL-guided ветвление.
+
+**Реализация** (из `ParallelMuse/functionality_specified_partial_rollout.py`):
+
+1. Для каждого шага вычисляется perplexity (строки 113-157):
+   ```python
+   think_ppl = np.exp(np.mean(entropies[think_start+1: think_end]))
+   tool_call_ppl = np.exp(np.mean(entropies[tool_call_start+1: tool_call_end]))
+   ```
+2. Выбираются шаги с максимальной неопределённостью (строки 285-317):
+   ```python
+   branch_step = sorted(branch_step, key=lambda x: x['step_ppl'], reverse=True)[:topk]
+   ```
+3. На каждом выбранном шаге генерируются альтернативные продолжения:
+   ```python
+   rollout_single_traj(..., r['rollout'][:int(b['step_id'])], ...)  # обрезка до точки ветвления
+   ```
+
+**Режимы PPL:** `tool_call_ppl`, `think_ppl`, `mixed_ppl` (50/50), `all_ppl`
+
+**Параметры по умолчанию:** `partial_sampling_topk=2` (2 точки ветвления), `partial_sampling_times_per_pos=3` (3 альтернативы на точку), `sampling_budget=8`
+
+### 8.4 Open-World Memory
+
+**Цель:** Документы → knowledge graph → агентные тренировочные данные.
+
+Конвейер: потоки данных → структурированная «память» → формализация (тройки `сущность-отношение-сущность`) → синтез QA-пар, для которых гарантированно нужен многошаговый поиск.
+
+Код не опубликован, но формат виден в `webshaper.500.jsonl`.
+
+### 8.5 Двухстадийный CPT (32K → 128K)
+
+- **Stage 1 (32K):** Короткие траектории (3-8 шагов). FAS-Planning + FAS-Reasoning. Цель: «грамматика» агентного формата.
+- **Stage 2 (128K):** Полные траектории (15-30+ шагов). HAS данные. Цель: удержание агентного поведения на длинных горизонтах.
+- **Эффект:** +3.3% Pass@1 vs одностадийный CPT. Обучение на обрезанных траекториях значительно хуже.
+
+### 8.6 ReSum + ReSum-GRPO (Scaffold-уровневый midtraining)
+
+**Цель:** Периодическое сжатие контекста + RL-адаптация к scaffold.
+
+**Механизм** (из `WebResummer/src/summary_utils.py`):
+- Каждые N шагов вызывается ReSumTool (30B модель) для сжатия в `<summary>...</summary>`
+- Два режима: начальное сжатие (`QUERY_SUMMARY_PROMPT`) и инкрементальное (`QUERY_SUMMARY_PROMPT_LAST`)
+- ReSum-GRPO: сегментация длинных траекторий по точкам сжатия + трансляция trajectory-level advantages
+- Эффект: +4.5% plug-and-play, +8.2% с ReSum-GRPO
+
+### 8.7 AgentFold — Self-Compressing Agent
+
+**Цель:** Модель сама решает, что сжимать в контексте.
+
+**Механизм** (из `AgentFold/infer.py`, строки 78-262):
+На каждом шаге модель генерирует:
+- `<think>` — рассуждение
+- `<compress>` — JSON: `{"compress_range": [3,4,5], "compress_text": "Steps 3-5 established..."}`
+- `<motivation>` — обоснование следующего действия
+- `<tool_call>` или `<answer>`
+
+Контекст форматируется как: `[Step 1]...full... [Compressed Step 2 to 5]...summary... [Step 6]...full...`
+
+### 8.8 ISR/ISE Filtering (WebLeaper)
+
+**Цель:** Курирование SFT-данных по эффективности.
+
+- **ISR** = |найденные сущности ∩ целевые| / |целевые| (coverage)
+- **ISE** = целевые сущности / шаги (efficiency)
+- Фильтрация: ISR > 0.3, ISE > 0.1
+- Hybrid Reward для RL: soft F-score с семантическим matching
+
+### 8.9 SailorFog-QA — Data с управляемой неопределённостью
+
+**Цель:** Вопросы с высокой начальной неопределённостью, требующие многошагового reasoning.
+
+Формат (из `WebSailor/dataset/sailorfog-QA.jsonl`):
+```json
+{"question": "A certain project jointly led by a well-known West Coast university's
+experimental physics laboratory became one of three key instruments...",
+ "answer": "Helioseismic and Magnetic Imager"}
+```
+
+Прямые имена заменены описаниями (information obfuscation) — модель должна сначала вывести, что «West Coast university» = Stanford, затем искать.
+
+### 8.10 Compressed Reasoning Aggregation (ParallelMuse)
+
+**Цель:** Test-time агрегация множества траекторий через сжатие.
+
+**Этап 1 — Report** (из `compressed_reasoning_aggregation.py`): Каждая траектория → структурированный отчёт (Solution Planning, Solution Methods, Final Reasoning).
+
+**Этап 2 — Integration:** Множественные отчёты → критическая оценка → выбор лучшего ответа.
+
+### 8.11 Что опубликовано vs. что только описано
+
+| Артефакт | Статус |
+|---|---|
+| ParallelMuse (PPL branching + aggregation) | Полный код |
+| AgentFold (self-compression) | Полный inference код |
+| WebResummer (ReSum) | Полный inference + eval код |
+| ReAct inference pipeline | Полный код |
+| SFT-траектории (WebDancer) | Примеры данных |
+| SailorFog-QA, WebShaper | Примеры данных |
+| **Код синтеза FAS/HAS** | **Не опубликован** |
+| **Open-World Memory pipeline** | **Не опубликован** |
+| **Training configs CPT** | **Не опубликованы** |
+| **Код DUPO/DAPO/ReSum-GRPO** | **Не опубликован** |
+| **Heavy Mode (IterResearch)** | **Не опубликован** |
